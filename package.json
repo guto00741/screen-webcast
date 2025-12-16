@@ -1,0 +1,25 @@
+{
+  "name": "webrtc-signaling-server",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.22.1",
+    "socket.io": "^4.8.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/guto00741/screen-webcast.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/guto00741/screen-webcast/issues"
+  },
+  "homepage": "https://github.com/guto00741/screen-webcast#readme",
+  "description": ""
+}
