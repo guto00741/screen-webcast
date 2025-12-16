@@ -1,54 +1,41 @@
 <template>
   <div class="app-container">
-    
-    <!-- TELA INICIAL: ESCOLHA DE MODO (Só aparece se não tiver ID na URL) -->
-    <div v-if="!mode" class="selection-screen">
-      <h1>WebCast P2P</h1>
-      <p>Escolha o modo de operação:</p>
-      <div class="buttons">
-        <button @click="initSource" class="btn-primary">💻 Transmitir (PC)</button>
-        <!-- O botão de receber é opcional, pois o celular entra via QR Code -->
-      </div>
+
+    <!-- TELA DE SELEÇÃO -->
+    <div v-if="!mode" class="intro">
+      <h1>⚡ Stream H.264 P2P</h1>
+      <button @click="initSource" class="btn-source">💻 Transmitir (PC)</button>
+      <p class="hint">Para receber, leia o QR Code gerado.</p>
     </div>
 
-    <!-- MODO FONTE (PC) -->
-    <div v-if="mode === 'source'" class="source-screen">
+    <!-- MODO PC (SOURCE) -->
+    <div v-if="mode === 'source'" class="source-view">
       <div class="header">
-        <h2>Transmitindo Tela</h2>
-        <span class="status" :class="{ connected: isConnected }">
-          {{ isConnected ? '● Celular Conectado' : '○ Aguardando Celular...' }}
-        </span>
+        <div class="status">
+          Status:
+          <span :style="{ color: isConnected ? '#4ff' : '#fa0' }">
+            {{ isConnected ? 'Conectado (H.264)' : 'Aguardando Leitura...' }}
+          </span>
+        </div>
       </div>
 
-      <div class="content">
-        <!-- Área do QR Code -->
-        <div v-if="!isConnected" class="qr-area">
-          <canvas ref="qrCanvas"></canvas>
-          <p>Aponte a câmera do celular para conectar</p>
-        </div>
+      <div v-if="!isConnected" class="qr-box">
+        <canvas ref="qrCanvas"></canvas>
+        <p>Aponte a câmera do celular</p>
+      </div>
 
-        <!-- Preview do Vídeo Local -->
-        <div class="video-preview">
-          <p>Sua visão:</p>
-          <video ref="localVideo" autoplay muted playsinline></video>
-        </div>
+      <div class="preview-box">
+        <small>Sua Tela (Preview Local):</small>
+        <video ref="localVideo" autoplay muted playsinline></video>
       </div>
     </div>
 
-    <!-- MODO ALVO (CELULAR) -->
-    <div v-if="mode === 'target'" class="target-screen">
-      <div v-if="!isConnected" class="loading">
-        <h2>Conectando...</h2>
-        <p>Aguardando stream do PC</p>
+    <!-- MODO CELULAR (TARGET) -->
+    <div v-if="mode === 'target'" class="target-view">
+      <div v-if="!isConnected" class="loading-overlay">
+        Conectando ao PC...
       </div>
-      <!-- Vídeo em tela cheia -->
-      <video 
-        ref="remoteVideo" 
-        autoplay 
-        playsinline 
-        controls 
-        class="fullscreen-video"
-      ></video>
+      <video ref="remoteVideo" autoplay playsinline controls class="cinema-mode"></video>
     </div>
 
   </div>
@@ -62,7 +49,7 @@ import QRCode from 'qrcode';
 import { v4 as uuidv4 } from 'uuid';
 
 // --- ESTADO ---
-const mode = ref(null); // 'source' ou 'target'
+const mode = ref(null);
 const roomId = ref('');
 const isConnected = ref(false);
 const localVideo = ref(null);
@@ -72,12 +59,50 @@ const qrCanvas = ref(null);
 let socket = null;
 let peer = null;
 
+// --- MAGIA DO H.264 ---
+// Esta função reescreve o texto de negociação (SDP) para priorizar H264
+const forceCodec = (sdp, codecName) => {
+  const lines = sdp.split('\n');
+  const mLineIndex = lines.findIndex(l => l.startsWith('m=video'));
+  if (mLineIndex === -1) return sdp;
+
+  // Regex para achar o Payload ID do codec (ex: 96, 102, etc)
+  const codecRegex = new RegExp(`a=rtpmap:(\\d+) ${codecName}/90000`);
+  let payload = null;
+
+  // Varre as linhas procurando o ID do H264
+  for (const line of lines) {
+    const match = line.match(codecRegex);
+    if (match) {
+      payload = match[1];
+      break;
+    }
+  }
+
+  if (!payload) {
+    console.warn(`Codec ${codecName} não encontrado no SDP. Usando padrão.`);
+    return sdp;
+  }
+
+  // Move o ID do H264 para o início da linha m=video
+  const mLine = lines[mLineIndex];
+  const elements = mLine.split(' ');
+
+  // Formato: m=video <porta> <proto> <id1> <id2> ...
+  const newMLine = [
+    ...elements.slice(0, 3),
+    payload, // Prioridade 1
+    ...elements.slice(3).filter(id => id !== payload) // Resto
+  ].join(' ');
+
+  lines[mLineIndex] = newMLine;
+  return lines.join('\n');
+};
+
 // --- INICIALIZAÇÃO ---
 onMounted(() => {
-  // Conecta ao servidor (vazio = mesmo domínio/porta do site)
-  socket = io();
+  socket = io(); // Conecta no mesmo host
 
-  // Verifica se veio um Room ID na URL (Celular lendo QR)
   const params = new URLSearchParams(window.location.search);
   const roomParam = params.get('room');
 
@@ -86,150 +111,191 @@ onMounted(() => {
   }
 });
 
-// --- LÓGICA DO PC (FONTE) ---
+// --- LÓGICA FONTE (PC) ---
 const initSource = async () => {
   mode.value = 'source';
-  roomId.value = uuidv4(); // Gera ID único
+  roomId.value = uuidv4();
 
   try {
-    // 1. Pede permissão para gravar a tela
-    const stream = await navigator.mediaDevices.getDisplayMedia({ 
-      video: { cursor: "always" }, 
-      audio: false 
+    // Solicita tela (Tente selecionar "Tela Cheia" ou "Janela" para melhor performance)
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: {
+        cursor: "always",
+        frameRate: 60, // Tenta 60fps se hardware aguentar
+        width: { ideal: 1920 },
+        height: { ideal: 1080 }
+      },
+      audio: false
     });
 
-    // Mostra preview local
-    await nextTick();
     if (localVideo.value) localVideo.value.srcObject = stream;
 
-    // Se o usuário parar de compartilhar pelo navegador, encerra tudo
-    stream.getVideoTracks()[0].onended = () => {
-      alert("Compartilhamento encerrado");
-      window.location.reload();
-    };
+    // Detecta se usuário parou de compartilhar
+    stream.getVideoTracks()[0].onended = () => window.location.reload();
 
-    // 2. Entra na sala Socket
     socket.emit('join-room', roomId.value);
+    generateQR();
 
-    // 3. Gera QR Code
-    generateQRCode();
-
-    // 4. Aguarda o celular entrar na sala
     socket.on('peer-joined', () => {
-      createPeer(true, stream); // true = initiator (começa a conexão)
+      // Inicia conexão como Initiator
+      createPeer(true, stream);
     });
 
-    // Recebe resposta do celular
-    socket.on('signal', (data) => {
-      if (peer) peer.signal(data.signal);
-    });
+    socket.on('signal', data => peer && peer.signal(data.signal));
 
-  } catch (err) {
-    console.error("Erro ao capturar tela:", err);
-    mode.value = null; // Volta pro inicio
+  } catch (e) {
+    console.error(e);
+    mode.value = null;
   }
 };
 
-const generateQRCode = async () => {
-  await nextTick();
+const generateQR = () => {
   const url = `${window.location.origin}?room=${roomId.value}`;
-  QRCode.toCanvas(qrCanvas.value, url, { width: 250, margin: 2 }, (error) => {
-    if (error) console.error(error);
+  nextTick(() => {
+    QRCode.toCanvas(qrCanvas.value, url, { width: 256, margin: 1 }, err => {
+      if (err) console.error(err);
+    });
   });
 };
 
-// --- LÓGICA DO CELULAR (ALVO) ---
+// --- LÓGICA ALVO (CELULAR) ---
 const initTarget = (id) => {
   mode.value = 'target';
   roomId.value = id;
 
-  socket.emit('join-room', roomId.value);
+  socket.emit('join-room', id);
 
-  socket.on('signal', (data) => {
-    // Se o peer ainda não existe, cria (passivo)
+  socket.on('signal', data => {
     if (!peer) createPeer(false, null);
     peer.signal(data.signal);
   });
-  
-  // O PC pode desconectar
+
   socket.on('peer-disconnected', () => {
-    alert("O PC desconectou.");
+    alert("Transmissão encerrada.");
     window.location.href = "/";
   });
 };
 
-// --- WEBRTC (COMUM AOS DOIS) ---
+// --- CRIAÇÃO DO PEER (COM H.264) ---
 const createPeer = (initiator, stream) => {
   peer = new SimplePeer({
     initiator: initiator,
-    trickle: false, // Simples, espera coletar todos candidatos ICE antes de enviar
+    trickle: false,
     stream: stream,
-    config: { 
+    // AQUI ESTÁ O TRUQUE:
+    sdpTransform: (sdp) => {
+      console.log("Aplicando filtro H.264...");
+      return forceCodec(sdp, 'H264');
+    },
+    config: {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:global.stun.twilio.com:3478' }
-      ] 
+      ]
     }
   });
 
-  peer.on('signal', (data) => {
-    socket.emit('signal', {
-      signal: data,
-      room: roomId.value
-    });
+  peer.on('signal', data => {
+    socket.emit('signal', { signal: data, room: roomId.value });
   });
 
   peer.on('connect', () => {
-    console.log('P2P Conectado!');
     isConnected.value = true;
+    console.log('Conexão P2P estabelecida com sucesso.');
   });
 
-  peer.on('stream', (remoteStream) => {
-    if (mode.value === 'target' && remoteVideo.value) {
-      remoteVideo.value.srcObject = remoteStream;
-    }
+  peer.on('stream', remoteStream => {
+    if (remoteVideo.value) remoteVideo.value.srcObject = remoteStream;
   });
-  
-  peer.on('error', err => console.error('Peer error:', err));
+
+  peer.on('error', err => console.error('Erro Peer:', err));
 };
 </script>
 
 <style>
-/* CSS Reset básico */
-body { margin: 0; padding: 0; font-family: sans-serif; background: #1a1a1a; color: white; }
+/* Estilos Cyberpunk/Dark */
+body {
+  margin: 0;
+  background: #0f0f13;
+  color: #fff;
+  font-family: 'Segoe UI', sans-serif;
+  overflow: hidden;
+}
 
 .app-container {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  min-height: 100vh;
+  height: 100vh;
+}
+
+.intro {
   text-align: center;
 }
 
-/* Tela de Seleção */
-.selection-screen button {
-  padding: 15px 30px;
-  font-size: 1.2rem;
-  background: #42b883;
-  color: white;
+.btn-source {
+  background: #7000ff;
+  color: #fff;
   border: none;
-  border-radius: 8px;
+  padding: 20px 40px;
+  font-size: 1.5rem;
+  border-radius: 12px;
   cursor: pointer;
-  margin-top: 20px;
+  transition: 0.3s;
+  box-shadow: 0 0 20px rgba(112, 0, 255, 0.4);
 }
 
-/* Modo PC */
-.source-screen { width: 100%; max-width: 800px; padding: 20px; }
-.status { font-weight: bold; color: #ffcc00; }
-.status.connected { color: #42b883; }
+.btn-source:hover {
+  background: #8a2be2;
+  transform: scale(1.05);
+}
 
-.content { margin-top: 20px; display: flex; flex-direction: column; align-items: center; gap: 20px;}
-.video-preview video { width: 100%; max-width: 400px; border: 2px solid #333; border-radius: 8px; }
-canvas { border-radius: 10px; }
+.source-view {
+  text-align: center;
+  width: 100%;
+  max-width: 600px;
+}
 
-/* Modo Mobile */
-.target-screen { width: 100%; height: 100vh; background: black; display: flex; align-items: center; justify-content: center; }
-.fullscreen-video { width: 100%; height: 100%; object-fit: contain; }
-.loading { position: absolute; z-index: 10; text-align: center; }
+.qr-box {
+  background: white;
+  padding: 10px;
+  border-radius: 10px;
+  display: inline-block;
+  margin: 20px 0;
+}
+
+.qr-box p {
+  color: #333;
+  margin: 5px 0 0;
+  font-weight: bold;
+}
+
+.preview-box video {
+  width: 100%;
+  border-radius: 8px;
+  border: 1px solid #333;
+  opacity: 0.5;
+}
+
+.target-view {
+  width: 100%;
+  height: 100vh;
+  background: #000;
+}
+
+.cinema-mode {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.loading-overlay {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 1.5rem;
+  color: #4ff;
+}
 </style>
